@@ -22,59 +22,151 @@ else
 fi
 
 mkdir -p ${OUTDIR}
+OUTDIR=$(realpath ${OUTDIR})
+
+########################################
+# Kernel Build
+########################################
 
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/linux-stable" ]; then
-    #Clone only if the repository does not exist.
 	echo "CLONING GIT LINUX STABLE VERSION ${KERNEL_VERSION} IN ${OUTDIR}"
 	git clone ${KERNEL_REPO} --depth 1 --single-branch --branch ${KERNEL_VERSION}
 fi
+
 if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     cd linux-stable
     echo "Checking out version ${KERNEL_VERSION}"
     git checkout ${KERNEL_VERSION}
 
-    # TODO: Add your kernel build steps here
+    # Kernel build steps
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} mrproper
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} Image
 fi
 
 echo "Adding the Image in outdir"
+cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}/Image
+
+########################################
+# Root Filesystem Setup
+########################################
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
 if [ -d "${OUTDIR}/rootfs" ]
 then
 	echo "Deleting rootfs directory at ${OUTDIR}/rootfs and starting over"
-    sudo rm  -rf ${OUTDIR}/rootfs
+    sudo rm -rf ${OUTDIR}/rootfs
 fi
 
-# TODO: Create necessary base directories
+# Create necessary base directories
+mkdir -p ${OUTDIR}/rootfs/{bin,dev,etc,home,lib,lib64,proc,sbin,sys,tmp,var}
+mkdir -p ${OUTDIR}/rootfs/usr/{bin,lib,sbin}
+
+########################################
+# BusyBox Build
+########################################
 
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/busybox" ]
 then
-git clone git://busybox.net/busybox.git
+    git clone git://busybox.net/busybox.git
     cd busybox
     git checkout ${BUSYBOX_VERSION}
-    # TODO:  Configure busybox
+    make distclean
+    make defconfig
 else
     cd busybox
 fi
 
-# TODO: Make and install busybox
+# Make and install busybox
+make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} CONFIG_PREFIX=${OUTDIR}/rootfs install
 
-echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+########################################
+# Library Dependencies
+########################################
 
-# TODO: Add library dependencies to rootfs
+cd ${OUTDIR}/rootfs
 
-# TODO: Make device nodes
+SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
 
-# TODO: Clean and build the writer utility
+cp ${SYSROOT}/lib/ld-linux-aarch64.so.1 lib
+cp ${SYSROOT}/lib64/libc.so.6 lib64
+cp ${SYSROOT}/lib64/libm.so.6 lib64
+cp ${SYSROOT}/lib64/libresolv.so.2 lib64
 
-# TODO: Copy the finder related scripts and executables to the /home directory
-# on the target rootfs
+########################################
+# Device Nodes
+########################################
 
-# TODO: Chown the root directory
+sudo mknod -m 666 dev/null c 1 3 || true
+sudo mknod -m 600 dev/console c 5 1 || true
 
-# TODO: Create initramfs.cpio.gz
+########################################
+# Build Writer Utility
+########################################
+
+echo "Cross-compiling writer for ARM..."
+cd ${FINDER_APP_DIR}
+
+# Clean any previous build (optional)
+make clean || true
+
+# Direct cross-compile using ARM toolchain
+${CROSS_COMPILE}gcc -Wall -Werror -O2 -o ${OUTDIR}/writer writer.c
+
+# Copy to rootfs home
+cp ${OUTDIR}/writer ${OUTDIR}/rootfs/home/writer
+chmod +x ${OUTDIR}/rootfs/home/writer
+
+########################################
+# Copy Finder Scripts and Conf
+########################################
+
+cp finder.sh finder-test.sh autorun-qemu.sh ${OUTDIR}/rootfs/home/
+
+mkdir -p ${OUTDIR}/rootfs/home/conf
+cp ../conf/username.txt ${OUTDIR}/rootfs/home/conf/
+cp ../conf/assignment.txt ${OUTDIR}/rootfs/home/conf/
+
+# Fix path inside finder-test.sh
+sed -i 's|\.\./conf/assignment.txt|conf/assignment.txt|' ${OUTDIR}/rootfs/home/finder-test.sh
+
+chmod +x ${OUTDIR}/rootfs/home/*.sh
+
+# Patch shebang: /bin/bash → /bin/sh (BusyBox compatible)
+sed -i '1s|^#! */bin/bash|#!/bin/sh|' ${OUTDIR}/rootfs/home/finder.sh
+
+########################################
+# Create init Script
+########################################
+
+cat > ${OUTDIR}/rootfs/init << 'EOF'
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+echo "Boot Successful"
+exec /bin/sh
+EOF
+
+chmod +x ${OUTDIR}/rootfs/init
+
+########################################
+# Set Ownership
+########################################
+
+sudo chown -R root:root ${OUTDIR}/rootfs
+
+########################################
+# Create initramfs
+########################################
+
+cd ${OUTDIR}/rootfs
+find . | cpio -H newc -ov --owner root:root > ${OUTDIR}/initramfs.cpio
+gzip -f ${OUTDIR}/initramfs.cpio
+
+echo "Build Complete"
+echo "Image: ${OUTDIR}/Image"
+echo "Initramfs: ${OUTDIR}/initramfs.cpio.gz"
