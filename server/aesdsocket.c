@@ -17,10 +17,10 @@
 #define BUFFER_SIZE 1024
 
 int server_fd = -1;
+int global_fd = -1; // single file descriptor for /var/tmp/aesdsocketdata
 char *filename = "/var/tmp/aesdsocketdata";
 pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// Linked list to track client threads
 struct thread_node {
     pthread_t tid;
     struct thread_node *next;
@@ -34,7 +34,7 @@ volatile sig_atomic_t exit_flag = 0;
 void signal_handler(int sig) {
     syslog(LOG_INFO, "Caught signal, exiting");
     exit_flag = 1;
-    if (server_fd != -1) close(server_fd);  // unblock accept()
+    if (server_fd != -1) close(server_fd); // unblock accept
 }
 
 // Add thread to linked list
@@ -54,7 +54,7 @@ void add_thread(pthread_t tid) {
     pthread_mutex_unlock(&thread_list_lock);
 }
 
-// Client thread function
+// Client thread
 void *client_handler(void *arg) {
     int client_fd = *((int *)arg);
     free(arg);
@@ -67,60 +67,40 @@ void *client_handler(void *arg) {
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
     } else strcpy(client_ip, "unknown");
 
-    int fd = open(filename, O_CREAT | O_APPEND | O_RDWR | O_SYNC, 0644);
-    if (fd < 0) { perror("open file failed"); close(client_fd); return NULL; }
-
     char buffer[BUFFER_SIZE];
     ssize_t bytes_read;
-    ssize_t start;
 
     while ((bytes_read = read(client_fd, buffer, sizeof(buffer))) > 0) {
-        start = 0;
-        for (ssize_t i = 0; i < bytes_read; i++) {
-            if (buffer[i] == '\n') {
-                pthread_mutex_lock(&file_lock);
-                if (write(fd, &buffer[start], i - start + 1) != i - start + 1)
-                    perror("write to file failed");
-                fsync(fd);
-                pthread_mutex_unlock(&file_lock);
-                start = i + 1;
+        pthread_mutex_lock(&file_lock);
+        if (write(global_fd, buffer, bytes_read) != bytes_read) {
+            perror("write to file failed");
+        }
+        fsync(global_fd); // flush immediately
+        pthread_mutex_unlock(&file_lock);
+
+        // Echo file content back to client
+        pthread_mutex_lock(&file_lock);
+        lseek(global_fd, 0, SEEK_SET);
+        ssize_t file_bytes;
+        char file_buf[BUFFER_SIZE];
+        while ((file_bytes = read(global_fd, file_buf, sizeof(file_buf))) > 0) {
+            if (write(client_fd, file_buf, file_bytes) != file_bytes) {
+                perror("write to socket failed");
+                break;
             }
         }
-        // Write any remaining bytes from this read
-        if (start < bytes_read) {
-            pthread_mutex_lock(&file_lock);
-            if (write(fd, &buffer[start], bytes_read - start) != bytes_read - start)
-                perror("write to file failed");
-            fsync(fd);
-            pthread_mutex_unlock(&file_lock);
-        }
-    }
-
-    // Write leftover bytes if client disconnected without newline
-    if (bytes_read == 0 && start > 0) {
-        // already written? skip
-    } else if (bytes_read == 0 && start == 0) {
-        // nothing to write if empty
-    } else if (bytes_read == 0 && start < bytes_read) {
-        pthread_mutex_lock(&file_lock);
-        if (write(fd, &buffer[start], bytes_read - start) != bytes_read - start)
-            perror("write remaining bytes on disconnect failed");
-        fsync(fd);
         pthread_mutex_unlock(&file_lock);
     }
 
-    close(fd);
     close(client_fd);
     syslog(LOG_INFO, "Closed connection from %s", client_ip);
     return NULL;
 }
 
-// Timestamp thread function
+// Timestamp thread
 void *timestamp_thread_func(void *arg) {
     (void)arg;
-    int fd;
     char timestamp[128];
-
     while (!exit_flag) {
         sleep(10);
         time_t now = time(NULL);
@@ -130,14 +110,10 @@ void *timestamp_thread_func(void *arg) {
                  "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
 
         pthread_mutex_lock(&file_lock);
-        fd = open(filename, O_CREAT | O_APPEND | O_RDWR | O_SYNC, 0644);
-        if (fd >= 0) {
-            write(fd, timestamp, strlen(timestamp));
-            fsync(fd);
-            close(fd);
-        } else {
-            perror("timestamp: open file failed");
+        if (write(global_fd, timestamp, strlen(timestamp)) != (ssize_t)strlen(timestamp)) {
+            perror("timestamp write failed");
         }
+        fsync(global_fd);
         pthread_mutex_unlock(&file_lock);
     }
     return NULL;
@@ -147,7 +123,7 @@ int main(int argc, char *argv[]) {
     int daemon_flag = 0;
     if (argc == 2 && strcmp(argv[1], "-d") == 0) daemon_flag = 1;
 
-    unlink(filename);
+    unlink(filename); // remove old file
 
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
@@ -156,9 +132,20 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
+    // Open global file once
+    global_fd = open(filename, O_CREAT | O_APPEND | O_RDWR | O_SYNC, 0644);
+    if (global_fd < 0) { perror("open file failed"); return -1; }
+
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
         perror("socket failed"); return -1;
     }
+	
+	int reuse = 1;
+if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+    perror("setsockopt failed");
+    close(server_fd);
+    return -1;
+}
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -172,7 +159,7 @@ int main(int argc, char *argv[]) {
         perror("bind failed"); close(server_fd); return -1;
     }
 
-    // Daemonize if requested
+    // Daemonize
     if (daemon_flag) {
         pid_t pid = fork();
         if (pid < 0) { perror("fork failed"); exit(EXIT_FAILURE); }
@@ -215,7 +202,7 @@ int main(int argc, char *argv[]) {
         add_thread(tid);
     }
 
-    // Join all client threads
+    // Join client threads
     pthread_mutex_lock(&thread_list_lock);
     struct thread_node *tmp = thread_list;
     while (tmp) {
@@ -229,6 +216,7 @@ int main(int argc, char *argv[]) {
     // Join timestamp thread
     pthread_join(ts_thread, NULL);
 
+    close(global_fd);
     close(server_fd);
     closelog();
     return 0;
