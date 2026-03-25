@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,7 +168,12 @@ if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) 
 
         if (setsid() < 0) { perror("setsid failed"); exit(EXIT_FAILURE); }
 
-        chdir("/"); umask(0);
+       // chdir("/"); umask(0);
+	if (chdir("/") != 0) {
+    	perror("chdir");
+    	return -1;
+	}
+	umask(0);
         close(STDIN_FILENO); close(STDOUT_FILENO); close(STDERR_FILENO);
     }
 
