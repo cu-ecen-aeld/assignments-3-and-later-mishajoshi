@@ -1,7 +1,6 @@
 CC ?= gcc
 
 CFLAGS += -Wall -Werror
-LDFLAGS += $(LDFLAGS)
 
 TARGET = aesdsocket
 OBJS = aesdsocket.o
