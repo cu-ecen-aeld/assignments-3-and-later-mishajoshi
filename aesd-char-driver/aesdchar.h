@@ -5,6 +5,11 @@
  *      Author: Dan Walkes
  */
 
+
+#include <linux/mutex.h>
+#include <linux/types.h>
+#include "aesd-circular-buffer.h"
+
 #ifndef AESD_CHAR_DRIVER_AESDCHAR_H_
 #define AESD_CHAR_DRIVER_AESDCHAR_H_
 
@@ -28,7 +33,16 @@ struct aesd_dev
     /**
      * TODO: Add structure(s) and locks needed to complete assignment requirements
      */
-    struct cdev cdev;     /* Char device structure      */
+	struct aesd_circular_buffer buffer;
+
+    	struct mutex lock;
+
+	char *pending_write_buffer;
+	size_t pending_write_size; 
+
+
+
+   struct cdev cdev;     /* Char device structure      */
 };
 
 
